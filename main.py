@@ -20,7 +20,7 @@ PORTFOLIO_SIZE = 5
 CASH_PER_STOCK = 1000 
 TRAIL_PERCENT = 10.0 
 
-# Expanded list to ensure we find momentum
+# High-Quality Value Candidates (March 2026)
 value_candidates = ["GDDY", "EXPE", "BKNG", "GIB", "CTSH", "YOU", "ADBE", "STLD", "AMAT", "HCA"]
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
@@ -31,57 +31,64 @@ def send_telegram_msg(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    params = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    params = {"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 **Magic Momentum Alert**\n{text}", "parse_mode": "Markdown"}
     requests.get(url, params=params)
 
-# --- 3. THE STRATEGY ENGINE ---
-def get_6m_momentum(symbol):
+# --- 3. THE PROFESSIONAL TREND FILTER ---
+def is_above_200_ma(symbol):
+    """Checks if the current price is above the 200-Day Moving Average."""
     try:
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=180)
+        start_date = end_date - timedelta(days=365) # Get a year of data to calculate 200-MA
+        
         request = StockBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Day, start=start_date, end=end_date)
         bars = data_client.get_stock_bars(request).df
-        # Formula: (Price Now / Price 6 Months Ago) - 1
-        return (bars['close'].iloc[-1] / bars['close'].iloc[0]) - 1
+        
+        # Calculate the 200-Day Simple Moving Average
+        current_price = bars['close'].iloc[-1]
+        moving_average_200 = bars['close'].rolling(window=200).mean().iloc[-1]
+        
+        # Return True if price is above the line, else False
+        return current_price > moving_average_200
     except:
-        return -99
+        return False
 
 def run_strategy():
-    summary = "🚨 **Magic Momentum Execution Report**\n\n"
+    summary = ""
+    success_count = 0
     
-    scored_list = []
+    # Filter for the Golden Line (200-MA)
+    filtered_list = []
     for ticker in value_candidates:
-        score = get_6m_momentum(ticker)
-        # Only add to list if momentum is positive (> 0)
-        if score > 0:
-            scored_list.append({'ticker': ticker, 'score': score})
+        if is_above_200_ma(ticker):
+            filtered_list.append(ticker)
     
-    # --- SAFETY CHECK ---
-    if not scored_list:
-        send_telegram_msg("⚠️ **Bot Update**: No stocks in the current list have positive 6-month momentum. No trades were executed.")
+    if not filtered_list:
+        send_telegram_msg("System scan complete. No candidates are currently above their 200-day trend line. Staying in cash to protect capital.")
         return
 
-    top_picks = pd.DataFrame(scored_list).sort_values(by='score', ascending=False).head(PORTFOLIO_SIZE)
-    
-    for ticker in top_picks['ticker']:
+    # Execute Trades for the first 5 healthy stocks
+    for ticker in filtered_list[:PORTFOLIO_SIZE]:
         try:
-            # 1. Buy
+            # Buy
             trading_client.submit_order(MarketOrderRequest(
                 symbol=ticker, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
             ))
             
-            # 2. Protect
+            # Safety delay then protect
             time.sleep(5) 
             pos = trading_client.get_open_position(ticker)
             trading_client.submit_order(TrailingStopOrderRequest(
                 symbol=ticker, qty=pos.qty, side=OrderSide.SELL, 
                 time_in_force=TimeInForce.GTC, trail_percent=TRAIL_PERCENT
             ))
-            summary += f"✅ **{ticker}**: Bought & Protected\n"
+            summary += f"✅ **{ticker}** (Added to Portfolio)\n"
+            success_count += 1
         except Exception as e:
-            summary += f"❌ **{ticker}**: Error: {str(e)}\n"
+            summary += f"❌ **{ticker}** (Error: {str(e)})\n"
 
-    send_telegram_msg(summary)
+    if success_count > 0:
+        send_telegram_msg(f"Trades Executed:\n{summary}\nSafety: 10% Trailing Stops Active.")
 
 if __name__ == "__main__":
     run_strategy()
