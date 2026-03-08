@@ -30,7 +30,6 @@ def get_official_mf_tickers():
     print("🔐 Attempting Login to MagicFormulaInvesting.com...")
     session = requests.Session()
     
-    # We add 'Headers' to look like a real Chrome browser
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.magicformulainvesting.com/Account/LogOn"
@@ -39,10 +38,8 @@ def get_official_mf_tickers():
     login_url = "https://www.magicformulainvesting.com/Account/LogOn"
     
     try:
-        # Step 1: Get the login page first to handle cookies/tokens
         session.get(login_url, headers=headers)
         
-        # Step 2: Post Login Data
         login_data = {
             "Email": MF_EMAIL, 
             "Password": MF_PASS, 
@@ -50,27 +47,23 @@ def get_official_mf_tickers():
         }
         login_response = session.post(login_url, data=login_data, headers=headers)
         
-        # Check if login worked by looking for "Log Off" in the HTML
         if "Log Off" not in login_response.text:
             print("❌ Login Failed. Check your GitHub Secrets for Email/Password typos.")
             return []
         
         print("✅ Login Successful. Requesting 50 Stocks (Market Cap > 50M)...")
 
-        # Step 3: Get the Screen Results
         screen_url = "https://www.magicformulainvesting.com/Screening/StockScreen"
         screen_params = {
             "MinimumMarketCap": "50",
-            "Select30": "false", # This toggle is what chooses 50 stocks vs 30
+            "Select30": "false", 
             "Submit": "Get Stocks"
         }
         
         response = session.post(screen_url, data=screen_params, headers=headers)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Step 4: Extract Tickers from the table
         tickers = []
-        # The site usually wraps tickers in <td> tags with a specific class or near a link
         for link in soup.find_all('a'):
             href = link.get('href', '')
             if '/Screening/StockDetails/' in href:
@@ -90,7 +83,6 @@ def is_above_200_ma(symbol):
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=365)
-        # Handle ticker formatting for Alpaca (e.g., BRK-B)
         symbol = symbol.replace('.', '-')
         
         request = StockBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Day, start=start_date, end=end_date)
@@ -101,4 +93,56 @@ def is_above_200_ma(symbol):
         
         return current_price > ma200
     except Exception as e:
-        # If
+        # If we can't get data for a specific ticker, we skip it for safety
+        print(f"Skipping {symbol}: No data found for 200-MA check.")
+        return False
+
+# --- 4. EXECUTION ENGINE ---
+def run_strategy():
+    send_telegram_msg("🕵️‍♂️ **Magic Momentum Scan Started**...")
+    
+    official_list = get_official_mf_tickers()
+    
+    if not official_list:
+        send_telegram_msg("⚠️ **System Error**: Scraper returned 0 stocks. Check GitHub Action logs.")
+        return
+        
+    # Send the full list to Telegram for your confirmation
+    send_telegram_msg(f"📋 **Official MF List Found**: {', '.join(official_list[:10])}... (See logs for all 50)")
+
+    final_picks = []
+    for t in official_list:
+        if is_above_200_ma(t):
+            final_picks.append(t)
+            if len(final_picks) >= 5: 
+                break
+    
+    if not final_picks:
+        send_telegram_msg("📊 Scan complete. Found high-quality stocks, but none are currently in a 200-day uptrend. Staying in cash.")
+        return
+
+    summary = "🚀 **Trades Executed**\n"
+    for ticker in final_picks:
+        try:
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=ticker, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+            ))
+            time.sleep(2) 
+            pos = trading_client.get_open_position(ticker)
+            trading_client.submit_order(TrailingStopOrderRequest(
+                symbol=ticker, qty=pos.qty, side=OrderSide.SELL, 
+                time_in_force=TimeInForce.GTC, trail_percent=TRAIL_PERCENT
+            ))
+            summary += f"✅ **{ticker}**\n"
+        except Exception as e:
+            summary += f"❌ **{ticker}**: {e}\n"
+    
+    send_telegram_msg(summary)
+
+def send_telegram_msg(text):
+    if not TELEGRAM_TOKEN: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+
+if __name__ == "__main__":
+    run_strategy()
