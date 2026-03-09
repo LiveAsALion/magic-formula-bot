@@ -30,4 +30,4 @@ jobs:
         MF_PASSWORD: ${{ secrets.MF_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python magic_formula_bot_v2.py
+      run: python main.py
