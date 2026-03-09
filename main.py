@@ -24,135 +24,30 @@ TRAIL_PERCENT = 10.0
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# --- 2. THE AUTHENTICATED SCRAPER ---
+# --- 2. THE PRECISION SCRAPER ---
 def get_official_mf_tickers():
+    print("🚀 Starting Strategy Run...")
     print("🍪 Step 1: Synchronizing Session...")
     session = requests.Session()
+    
+    # Precise URL for the screening tool
+    url = "https://www.magicformulainvesting.com/Screening/StockScreen"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Referer": "https://www.magicformulainvesting.com/Screening/StockScreen"
+        "Referer": "https://www.magicformulainvesting.com/",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1"
     }
     
     if not MF_COOKIE_VAL:
         return None, "❌ Error: MF_COOKIE Secret is missing."
 
+    # Sanitization: Strip spaces and remove any accidental quotes
+    clean_cookie = MF_COOKIE_VAL.strip().replace('"', '').replace("'", "")
+
     cookie_obj = requests.cookies.create_cookie(
         name="mfi", 
-        value=MF_COOKIE_VAL.strip(), 
-        domain="www.magicformulainvesting.com"
-    )
-    session.cookies.set_cookie(cookie_obj)
-    
-    try:
-        url = "https://www.magicformulainvesting.com/Screening/StockScreen"
-        
-        print("📡 Step 2: Sending GET request to screening page...")
-        # Added timeout=15 to prevent hanging
-        initial_page = session.get(url, headers=headers, timeout=15)
-        
-        if "Log Off" not in initial_page.text:
-            print(f"❌ Verification Failed. Status Code: {initial_page.status_code}")
-            return None, "💔 Session Expired"
-        
-        print("✅ Step 3: GET successful. Extracting token...")
-        soup = BeautifulSoup(initial_page.text, 'html.parser')
-        token_tag = soup.find('input', {'name': '__RequestVerificationToken'})
-        
-        if not token_tag:
-            return None, "⚠️ Security Token Missing"
-            
-        token = token_tag['value']
-        
-        payload = {
-            "MinimumMarketCap": "50",
-            "Select30": "false", 
-            "Submit": "Get Stocks",
-            "__RequestVerificationToken": token
-        }
-        
-        print("📡 Step 4: Sending POST request for stocks...")
-        response = session.post(url, data=payload, headers=headers, timeout=15)
-        result_soup = BeautifulSoup(response.text, 'html.parser')
-        
-        tickers = []
-        for link in result_soup.find_all('a'):
-            href = link.get('href', '')
-            if '/Screening/StockDetails/' in href:
-                ticker = link.text.strip()
-                if ticker and ticker not in tickers:
-                    tickers.append(ticker)
-        
-        if not tickers:
-            return None, "📋 Table empty."
-            
-        print(f"✅ Step 5: Success! Found {len(tickers)} tickers.")
-        return list(set(tickers)), "💚 Session Healthy"
-
-    except requests.exceptions.Timeout:
-        return None, "⏰ Connection Timed Out (Website is slow or blocking)"
-    except Exception as e:
-        return None, f"⚠️ Error: {str(e)}"
-
-# --- 3. TREND FILTER ---
-def is_above_200_ma(symbol):
-    try:
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365)
-        clean_symbol = symbol.replace('.', '-')
-        request = StockBarsRequest(symbol_or_symbols=[clean_symbol], timeframe=TimeFrame.Day, start=start_date, end=end_date)
-        bars = data_client.get_stock_bars(request).df
-        current_price = bars['close'].iloc[-1]
-        ma200 = bars['close'].rolling(window=200).mean().iloc[-1]
-        return current_price > ma200
-    except:
-        return False
-
-# --- 4. EXECUTION ---
-def run_strategy():
-    print("🚀 Starting Strategy Run...")
-    tickers, status_msg = get_official_mf_tickers()
-    
-    # Send heartbeat immediately
-    print(f"💓 Heartbeat Status: {status_msg}")
-    send_telegram_msg(f"💓 **Heartbeat**: {status_msg}")
-    
-    if not tickers:
-        print("🛑 No tickers found. Ending run.")
-        return
-
-    final_picks = []
-    for t in tickers:
-        if is_above_200_ma(t):
-            final_picks.append(t)
-            if len(final_picks) >= 5:
-                break
-    
-    if not final_picks:
-        send_telegram_msg(f"📊 Scan complete. Found {len(tickers)} stocks, but none are in an uptrend.")
-        return
-
-    summary = "🚀 **Trades Executed**\n"
-    for ticker in final_picks:
-        try:
-            symbol = ticker.replace('.', '-')
-            trading_client.submit_order(MarketOrderRequest(
-                symbol=symbol, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
-            ))
-            summary += f"✅ **{ticker}**\n"
-        except Exception as e:
-            summary += f"❌ **{ticker}**: {e}\n"
-    
-    send_telegram_msg(summary)
-
-def send_telegram_msg(text):
-    if not TELEGRAM_TOKEN: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-    except:
-        print("❌ Failed to send Telegram message.")
-
-if __name__ == "__main__":
-    run_strategy()
+        value=clean_cookie, 
+        domain="
