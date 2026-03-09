@@ -2,8 +2,9 @@ name: Monthly Magic Momentum Trade
 
 on:
   schedule:
+    # Runs at 14:15 UTC (9:15 AM EST) Monday-Friday
     - cron: '15 14 * * 1-5' 
-  workflow_dispatch:
+  workflow_dispatch: # Allows you to run it manually for testing
 
 jobs:
   trade:
@@ -24,10 +25,10 @@ jobs:
 
       - name: Execute Bot
         env:
+          # This section maps your GitHub Secrets to the names Python looks for
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          MAGIC_FORMULA_EMAIL: ${{ secrets.MAGIC_FORMULA_EMAIL }}
-          MAGIC_FORMULA_PASSWORD: ${{ secrets.MAGIC_FORMULA_PASSWORD }}
+          MF_COOKIE: ${{ secrets.MF_COOKIE }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
