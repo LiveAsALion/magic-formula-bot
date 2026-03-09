@@ -13,15 +13,13 @@ from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # --- 1. CONFIGURATION ---
-# It's recommended to use environment variables for security.
 API_KEY = os.getenv('ALPACA_API_KEY')
 SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
-MF_EMAIL = os.getenv('MF_EMAIL') # New: Your magicformulainvesting.com email
-MF_PASSWORD = os.getenv('MF_PASSWORD') # New: Your magicformulainvesting.com password
+MF_EMAIL = os.getenv('MF_EMAIL') 
+MF_PASSWORD = os.getenv('MF_PASSWORD')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# UPDATED USER-AGENT for better compatibility
 MY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 CASH_PER_STOCK = 1000
@@ -35,7 +33,7 @@ data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 def get_official_mf_tickers():
     """
     Robustly scrapes magicformulainvesting.com by simulating a full login session.
-    This bypasses simple cookie-based detection by handling the CSRF tokens and session state.
+    Enhanced with detailed logging and multiple parsing strategies.
     """
     print("🚀 Starting Strategy Run...")
     
@@ -59,7 +57,7 @@ def get_official_mf_tickers():
     session = requests.Session()
     
     try:
-        # Step 1: Get Login Page to retrieve CSRF token
+        # Step 1: Get Login Page
         print("📡 Step 1: Fetching login page...")
         response = session.get(login_url, headers=headers, timeout=15)
         if response.status_code != 200:
@@ -73,7 +71,7 @@ def get_official_mf_tickers():
         token = token_tag['value']
         
         # Step 2: Perform Login
-        print("📡 Step 2: Logging in to Magic Formula...")
+        print(f"📡 Step 2: Logging in as {MF_EMAIL}...")
         login_payload = {
             "Email": MF_EMAIL,
             "Password": MF_PASSWORD,
@@ -81,19 +79,18 @@ def get_official_mf_tickers():
             "login": "Login"
         }
         
-        # Add a small delay to mimic human behavior
-        time.sleep(random.uniform(1.0, 3.0))
-        
+        time.sleep(random.uniform(2.0, 4.0))
         login_response = session.post(login_url, data=login_payload, headers=headers, timeout=15)
         
-        # Check if login was successful (usually redirects or "Log Off" appears)
         if "Log Off" not in login_response.text:
             print(f"❌ Login Check Failed. URL: {login_response.url}")
-            return None, "💔 Login failed. Check credentials or site status."
+            if "Invalid" in login_response.text:
+                return None, "💔 Login failed: Invalid email or password."
+            return None, "💔 Login failed: 'Log Off' link not found in response."
             
         print("✅ Login successful.")
         
-        # Step 3: Get Screening Page (to get the specific token for the screening form)
+        # Step 3: Get Screening Page
         print("📡 Step 3: Fetching screening page...")
         screen_page_response = session.get(screen_url, headers=headers, timeout=15)
         screen_soup = BeautifulSoup(screen_page_response.text, 'html.parser')
@@ -104,7 +101,7 @@ def get_official_mf_tickers():
         
         screen_token = screen_token_tag['value']
         
-        # Step 4: Post Screening Request for 50 stocks
+        # Step 4: Post Screening Request
         print("📡 Step 4: Requesting stock list (Top 50)...")
         screen_payload = {
             "MinimumMarketCap": "50", 
@@ -113,10 +110,8 @@ def get_official_mf_tickers():
             "__RequestVerificationToken": screen_token
         }
         
-        # Update referer for the post request
         headers["Referer"] = screen_url
-        
-        time.sleep(random.uniform(1.0, 2.0))
+        time.sleep(random.uniform(2.0, 4.0))
         result_response = session.post(screen_url, data=screen_payload, headers=headers, timeout=15)
         
         if result_response.status_code != 200:
@@ -127,7 +122,8 @@ def get_official_mf_tickers():
         result_soup = BeautifulSoup(result_response.text, 'html.parser')
         
         tickers = []
-        # Find all links that point to stock details (the ticker text is inside)
+        
+        # Strategy A: Find all links that point to stock details
         for link in result_soup.find_all('a'):
             href = link.get('href', '')
             if '/Screening/StockDetails/' in href:
@@ -135,20 +131,26 @@ def get_official_mf_tickers():
                 if ticker and ticker not in tickers:
                     tickers.append(ticker)
         
-        # Backup: try parsing the table rows if link method fails
+        # Strategy B: If Strategy A fails, try parsing the table rows
         if not tickers:
-            table = result_soup.find('table', {'class': 'screeningdata'})
+            print("⚠️ Strategy A failed. Trying Strategy B (table parsing)...")
+            # Look for common table classes or patterns
+            table = result_soup.find('table', {'class': 'screeningdata'}) or result_soup.find('table')
             if table:
-                rows = table.find_all('tr')[1:] # Skip header
+                rows = table.find_all('tr')
                 for row in rows:
                     cols = row.find_all('td')
-                    if len(cols) > 1:
+                    if len(cols) >= 2:
+                        # Ticker is usually in the second column (index 1)
                         ticker = cols[1].text.strip()
-                        if ticker:
-                            tickers.append(ticker)
+                        # Basic validation for a ticker (usually 1-5 uppercase letters)
+                        if ticker and ticker.isupper() and 1 <= len(ticker) <= 5:
+                            if ticker not in tickers:
+                                tickers.append(ticker)
                             
         if not tickers:
-            return None, "📋 Table empty or layout changed. No tickers found."
+            # print("DEBUG: Response text start:", result_response.text[:1000])
+            return None, "📋 No tickers found in the results. Layout might have changed."
             
         print(f"✅ Success! Found {len(tickers)} tickers.")
         return list(set(tickers)), "💚 Session Healthy"
@@ -188,7 +190,7 @@ def run_strategy():
             pass
     
     if not tickers:
-        print("🛑 Run ended: No tickers retrieved.")
+        print(f"🛑 Run ended: {status_msg}")
         return
 
     # Find the top 5 that are currently in an uptrend
@@ -200,9 +202,6 @@ def run_strategy():
             final_picks.append(t)
             if len(final_picks) >= 5:
                 break
-        else:
-            # print(f"❌ {t} is below 200-MA.")
-            pass
     
     if not final_picks:
         print("📊 No stocks above 200-MA found in the current list.")
