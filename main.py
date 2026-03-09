@@ -2,8 +2,13 @@ import os
 import time
 import random
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+
+# Import yfinance for historical data
+import yfinance as yf
+
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -24,9 +29,9 @@ MY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (K
 CASH_PER_STOCK = 1000
 TRAIL_PERCENT = 10.0
 
-# Initialize Alpaca Clients
+# Initialize Alpaca Clients (only for trading, data will come from yfinance)
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+# data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY) # No longer needed for historical data
 
 # --- 2. THE IMPROVED SCRAPER ---
 def get_official_mf_tickers():
@@ -84,16 +89,16 @@ def get_official_mf_tickers():
         print(f"DEBUG: Login response final URL: {login_response.url}")
         print(f"DEBUG: Expected screen URL: {screen_url}")
 
-        # Relaxed login verification: Check if redirected to screening page or if 'Log Off' is present
+        # Relaxed login verification: Check if redirected to screening page or if \'Log Off\' is present
         if screen_url in login_response.url or "Log Off" in login_response.text:
-            print("✅ Login successful (redirected to screening page or 'Log Off' found).")
+            print("✅ Login successful (redirected to screening page or \'Log Off\' found).")
         else:
             print(f"❌ Login Check Failed. Final URL: {login_response.url}")
             if "Invalid" in login_response.text:
                 return None, "💔 Login failed: Invalid email or password."
-            print("DEBUG: First 1000 chars of login_response.text if 'Log Off' not found:")
+            print("DEBUG: First 1000 chars of login_response.text if \'Log Off\' not found:")
             print(login_response.text[:1000])
-            return None, "💔 Login failed: Neither redirected to screening page nor 'Log Off' link found."
+            return None, "💔 Login failed: Neither redirected to screening page nor \'Log Off\' link found."
             
         # Step 3: Get Screening Page (even if we were redirected, ensure we have the latest page content)
         print("📡 Step 3: Fetching screening page...")
@@ -168,20 +173,21 @@ def get_official_mf_tickers():
 # --- 3. TREND FILTER (200-MA) ---
 def is_above_200_ma(symbol):
     try:
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365)
-        clean_symbol = symbol.replace(".", "-")
-        request = StockBarsRequest(symbol_or_symbols=[clean_symbol], timeframe=TimeFrame.Day, start=start_date, end=end_date)
-        bars = data_client.get_stock_bars(request).df
+        # Use yfinance to get historical data
+        ticker = yf.Ticker(symbol)
+        # Fetch data for a longer period to ensure 200 data points are available
+        hist = ticker.history(period="1y") 
         
-        if bars.empty or len(bars) < 200:
+        if hist.empty or len(hist) < 200:
+            print(f"⚠️ Not enough data for {symbol} to calculate 200-MA.")
             return False
             
-        current_price = bars["close"].iloc[-1]
-        ma200 = bars["close"].rolling(window=200).mean().iloc[-1]
+        current_price = hist["Close"].iloc[-1]
+        ma200 = hist["Close"].rolling(window=200).mean().iloc[-1]
+        
         return current_price > ma200
     except Exception as e:
-        print(f"Error calculating MA for {symbol}: {e}")
+        print(f"Error calculating MA for {symbol} using yfinance: {e}")
         return False
 
 # --- 4. EXECUTION ENGINE ---
