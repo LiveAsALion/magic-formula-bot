@@ -2,7 +2,6 @@ import os
 import time
 import random
 import requests
-import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from alpaca.trading.client import TradingClient
@@ -13,12 +12,12 @@ from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # --- 1. CONFIGURATION ---
-API_KEY = os.getenv('ALPACA_API_KEY')
-SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
-MF_EMAIL = os.getenv('MF_EMAIL') 
-MF_PASSWORD = os.getenv('MF_PASSWORD')
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+MF_EMAIL = os.getenv("MF_EMAIL") 
+MF_PASSWORD = os.getenv("MF_PASSWORD")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
@@ -63,12 +62,12 @@ def get_official_mf_tickers():
         if response.status_code != 200:
             return None, f"❌ Failed to load login page: {response.status_code}"
             
-        soup = BeautifulSoup(response.text, 'html.parser')
-        token_tag = soup.find('input', {'name': '__RequestVerificationToken'})
+        soup = BeautifulSoup(response.text, "html.parser")
+        token_tag = soup.find("input", {"name": "__RequestVerificationToken"})
         if not token_tag:
             return None, "⚠️ CSRF token not found on login page."
         
-        token = token_tag['value']
+        token = token_tag["value"]
         
         # Step 2: Perform Login
         print(f"📡 Step 2: Logging in as {MF_EMAIL}...")
@@ -82,24 +81,30 @@ def get_official_mf_tickers():
         time.sleep(random.uniform(2.0, 4.0))
         login_response = session.post(login_url, data=login_payload, headers=headers, timeout=15)
         
-        if "Log Off" not in login_response.text:
-            print(f"❌ Login Check Failed. URL: {login_response.url}")
+        print(f"DEBUG: Login response final URL: {login_response.url}")
+        print(f"DEBUG: Expected screen URL: {screen_url}")
+
+        # Relaxed login verification: Check if redirected to screening page or if 'Log Off' is present
+        if screen_url in login_response.url or "Log Off" in login_response.text:
+            print("✅ Login successful (redirected to screening page or 'Log Off' found).")
+        else:
+            print(f"❌ Login Check Failed. Final URL: {login_response.url}")
             if "Invalid" in login_response.text:
                 return None, "💔 Login failed: Invalid email or password."
-            return None, "💔 Login failed: 'Log Off' link not found in response."
+            print("DEBUG: First 1000 chars of login_response.text if 'Log Off' not found:")
+            print(login_response.text[:1000])
+            return None, "💔 Login failed: Neither redirected to screening page nor 'Log Off' link found."
             
-        print("✅ Login successful.")
-        
-        # Step 3: Get Screening Page
+        # Step 3: Get Screening Page (even if we were redirected, ensure we have the latest page content)
         print("📡 Step 3: Fetching screening page...")
         screen_page_response = session.get(screen_url, headers=headers, timeout=15)
-        screen_soup = BeautifulSoup(screen_page_response.text, 'html.parser')
+        screen_soup = BeautifulSoup(screen_page_response.text, "html.parser")
         
-        screen_token_tag = screen_soup.find('input', {'name': '__RequestVerificationToken'})
+        screen_token_tag = screen_soup.find("input", {"name": "__RequestVerificationToken"})
         if not screen_token_tag:
-            return None, "⚠️ CSRF token not found on screening page."
+            return None, "⚠️ CSRF token not found on screening page after login."
         
-        screen_token = screen_token_tag['value']
+        screen_token = screen_token_tag["value"]
         
         # Step 4: Post Screening Request
         print("📡 Step 4: Requesting stock list (Top 50)...")
@@ -119,14 +124,14 @@ def get_official_mf_tickers():
             
         # Step 5: Parse Results
         print("📡 Step 5: Parsing results...")
-        result_soup = BeautifulSoup(result_response.text, 'html.parser')
+        result_soup = BeautifulSoup(result_response.text, "html.parser")
         
         tickers = []
         
         # Strategy A: Find all links that point to stock details
-        for link in result_soup.find_all('a'):
-            href = link.get('href', '')
-            if '/Screening/StockDetails/' in href:
+        for link in result_soup.find_all("a"):
+            href = link.get("href", "")
+            if "/Screening/StockDetails/" in href:
                 ticker = link.text.strip()
                 if ticker and ticker not in tickers:
                     tickers.append(ticker)
@@ -135,11 +140,12 @@ def get_official_mf_tickers():
         if not tickers:
             print("⚠️ Strategy A failed. Trying Strategy B (table parsing)...")
             # Look for common table classes or patterns
-            table = result_soup.find('table', {'class': 'screeningdata'}) or result_soup.find('table')
+            table = result_soup.find("table", {"class": "screeningdata"}) or result_soup.find("table")
             if table:
-                rows = table.find_all('tr')
-                for row in rows:
-                    cols = row.find_all('td')
+                rows = table.find_all("tr")
+                # Assuming header row and then data rows
+                for row in rows[1:]:
+                    cols = row.find_all("td")
                     if len(cols) >= 2:
                         # Ticker is usually in the second column (index 1)
                         ticker = cols[1].text.strip()
@@ -149,8 +155,9 @@ def get_official_mf_tickers():
                                 tickers.append(ticker)
                             
         if not tickers:
-            # print("DEBUG: Response text start:", result_response.text[:1000])
-            return None, "📋 No tickers found in the results. Layout might have changed."
+            print("DEBUG: No tickers found. Printing first 1000 chars of result_response.text:")
+            print(result_response.text[:1000])
+            return None, "📋 No tickers found in the results. Layout might have changed or table is empty."
             
         print(f"✅ Success! Found {len(tickers)} tickers.")
         return list(set(tickers)), "💚 Session Healthy"
@@ -163,15 +170,15 @@ def is_above_200_ma(symbol):
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=365)
-        clean_symbol = symbol.replace('.', '-')
+        clean_symbol = symbol.replace(".", "-")
         request = StockBarsRequest(symbol_or_symbols=[clean_symbol], timeframe=TimeFrame.Day, start=start_date, end=end_date)
         bars = data_client.get_stock_bars(request).df
         
         if bars.empty or len(bars) < 200:
             return False
             
-        current_price = bars['close'].iloc[-1]
-        ma200 = bars['close'].rolling(window=200).mean().iloc[-1]
+        current_price = bars["close"].iloc[-1]
+        ma200 = bars["close"].rolling(window=200).mean().iloc[-1]
         return current_price > ma200
     except Exception as e:
         print(f"Error calculating MA for {symbol}: {e}")
@@ -202,6 +209,9 @@ def run_strategy():
             final_picks.append(t)
             if len(final_picks) >= 5:
                 break
+        else:
+            # print(f"❌ {t} is below 200-MA.")
+            pass
     
     if not final_picks:
         print("📊 No stocks above 200-MA found in the current list.")
@@ -211,7 +221,7 @@ def run_strategy():
     summary = "🚀 **Trades Executed**\n"
     for ticker in final_picks:
         try:
-            symbol = ticker.replace('.', '-')
+            symbol = ticker.replace(".", "-")
             # Place Market Order
             trading_client.submit_order(MarketOrderRequest(
                 symbol=symbol, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
