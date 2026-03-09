@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
+import yfinance as yf
 from datetime import datetime, timedelta
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
@@ -14,73 +14,115 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # --- 1. CONFIGURATION ---
 API_KEY = os.getenv('ALPACA_API_KEY')
 SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
-MF_COOKIE_VAL = os.getenv('MF_COOKIE')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-MY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+CASH_PER_STOCK = 1000
+TRAIL_PERCENT = 10.0
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-def get_official_mf_tickers():
-    print("🚀 Starting Strategy Run...")
-    session = requests.Session()
-    url = "https://www.magicformulainvesting.com/Screening/StockScreen"
-    
-    headers = {
-        "User-Agent": MY_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://www.magicformulainvesting.com/Account/LogOn",
-        "Upgrade-Insecure-Requests": "1"
-    }
-    
-    if not MF_COOKIE_VAL:
-        return None, "❌ Error: MF_COOKIE Secret is missing."
-
-    clean_val = MF_COOKIE_VAL.strip().replace('"', '').replace("'", "")
-    session.cookies.set("mfi", clean_val, domain="www.magicformulainvesting.com")
-    
+# --- 2. THE MAGIC FORMULA ENGINE ---
+def get_magic_formula_picks():
+    print("🔭 Scanning S&P 500 universe for Magic Formula candidates...")
     try:
-        print(f"📡 Step 2: Accessing {url}...")
-        initial_page = session.get(url, headers=headers, timeout=15)
+        # Step 1: Get the S&P 500 list from Wikipedia
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        table = pd.read_html(url, attrs={'id': 'constituents'})[0]
+        tickers = table['Symbol'].str.replace('.', '-', regex=True).tolist()
         
-        # --- DEBUG BLOCK: SEEING WHAT THE BOT SEES ---
-        if "Log Off" not in initial_page.text:
-            print("❌ Landing Page Check Failed.")
-            print("--- DEBUG DATA START ---")
-            print(f"Status Code: {initial_page.status_code}")
-            # This helps us see if there is a 'Cloudflare' or 'Access Denied' message
-            print(f"HTML Snippet: {initial_page.text[:1000]}") 
-            print("--- DEBUG DATA END ---")
-            return None, "💔 Session Expired"
+        # We'll analyze the top 50 to keep the script fast
+        universe = tickers[:50]
+        scored_data = []
         
-        print("✅ Step 3: Session Valid. Extracting token...")
-        soup = BeautifulSoup(initial_page.text, 'html.parser')
-        token = soup.find('input', {'name': '__RequestVerificationToken'})['value']
+        for symbol in universe:
+            try:
+                stock = yf.Ticker(symbol)
+                info = stock.info
+                
+                # Formula Component 1: Earnings Yield (EBIT / Enterprise Value)
+                # We use EBITDA as a proxy for EBIT for reliability
+                ebitda = info.get('ebitda', 0)
+                ev = info.get('enterpriseValue', 1)
+                earnings_yield = ebitda / ev if ev > 0 else 0
+                
+                # Formula Component 2: Return on Assets (ROA)
+                roa = info.get('returnOnAssets', 0)
+                
+                if earnings_yield > 0 and roa > 0:
+                    scored_data.append({'ticker': symbol, 'ey': earnings_yield, 'roa': roa})
+                
+                time.sleep(0.1) # Be polite to the API
+            except:
+                continue
         
-        payload = {
-            "MinimumMarketCap": "50",
-            "Select30": "false", 
-            "Submit": "Get Stocks",
-            "__RequestVerificationToken": token
-        }
+        df = pd.DataFrame(scored_data)
+        # Rank them (Lower is better rank)
+        df['ey_rank'] = df['ey'].rank(ascending=False)
+        df['roa_rank'] = df['roa'].rank(ascending=False)
+        df['combined_rank'] = df['ey_rank'] + df['roa_rank']
         
-        response = session.post(url, data=payload, headers=headers, timeout=15)
-        result_soup = BeautifulSoup(response.text, 'html.parser')
-        tickers = [a.text.strip() for a in result_soup.find_all('a') if '/Screening/StockDetails/' in a.get('href', '')]
-        
-        return list(set(tickers)), "💚 Session Healthy"
-
+        picks = df.sort_values('combined_rank').head(15)['ticker'].tolist()
+        print(f"✅ Found {len(picks)} candidates via local calculation.")
+        return picks
     except Exception as e:
-        return None, f"⚠️ Error: {str(e)}"
+        print(f"⚠️ Screening Error: {e}")
+        return []
 
+# --- 3. TREND FILTER (200-MA) ---
+def is_above_200_ma(symbol):
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365)
+        request = StockBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Day, start=start_date, end=end_date)
+        bars = data_client.get_stock_bars(request).df
+        current_price = bars['close'].iloc[-1]
+        ma200 = bars['close'].rolling(window=200).mean().iloc[-1]
+        return current_price > ma200
+    except:
+        return False
+
+# --- 4. EXECUTION ---
 def run_strategy():
-    tickers, status_msg = get_official_mf_tickers()
-    if TELEGRAM_TOKEN:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                     params={"chat_id": TELEGRAM_CHAT_ID, "text": f"💓 **Heartbeat**: {status_msg}"})
+    print("🚀 Starting Trawler Run...")
+    candidates = get_magic_formula_picks()
     
+    if not candidates:
+        send_telegram_msg("⚠️ **System Error**: Failed to calculate Magic Formula picks.")
+        return
+
+    # Filter for the 200-MA Momentum
+    final_picks = [t for t in candidates if is_above_200_ma(t)][:5]
+    
+    status_msg = f"💚 System Healthy. Scanned {len(candidates)} stocks. Found {len(final_picks)} trending picks."
+    send_telegram_msg(f"💓 **Heartbeat**: {status_msg}")
+
+    if not final_picks:
+        send_telegram_msg("📊 Scan complete. No trending stocks found today.")
+        return
+
+    summary = "🚀 **Trades Executed**\n"
+    for ticker in final_picks:
+        try:
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=ticker, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+            ))
+            time.sleep(2)
+            pos = trading_client.get_open_position(ticker)
+            trading_client.submit_order(TrailingStopOrderRequest(
+                symbol=ticker, qty=pos.qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, trail_percent=TRAIL_PERCENT
+            ))
+            summary += f"✅ **{ticker}**\n"
+        except Exception as e:
+            summary += f"❌ **{ticker}**: {e}\n"
+    
+    send_telegram_msg(summary)
+
+def send_telegram_msg(text):
+    if not TELEGRAM_TOKEN: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+
 if __name__ == "__main__":
     run_strategy()
