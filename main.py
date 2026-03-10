@@ -366,8 +366,7 @@ def run_strategy():
     # Final Summary Message
     final_summary = f"*Magic Formula Bot Run Summary - {current_date.strftime('%Y-%m-%d %H:%M')} EST*\n\n" + "\n".join(summary_messages)
     if errors_encountered:
-        final_summary += "\n\n⚠️ *Errors/Warnings:*
-" + "\n".join(errors_encountered)
+        final_summary += "\n\n⚠️ *Errors/Warnings:*\n" + "\n".join(errors_encountered)
     
     send_telegram_message(final_summary)
 
