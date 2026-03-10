@@ -1,6 +1,5 @@
 import os
 import time
-import random
 import json
 import logging
 from datetime import datetime, timedelta
@@ -49,7 +48,6 @@ class PositionMetadata:
 
 # ====================== PORTFOLIO MANAGER ======================
 class PortfolioManager:
-    """Alpaca = single source of truth. JSON only for purchase metadata."""
     def __init__(self, trading_client: TradingClient):
         self.trading_client = trading_client
         self.metadata: Dict[str, PositionMetadata] = self._load_metadata()
@@ -91,27 +89,23 @@ class PortfolioManager:
         self.save_metadata()
 
 
-# ====================== MAGIC FORMULA SCREENER (NEW) ======================
+# ====================== MAGIC FORMULA SCREENER ======================
 class MagicFormulaScreener:
-    """Self-contained MF screener — no external site dependency."""
     @staticmethod
     def get_top_candidates(n: int = 50) -> List[str]:
         logger.info("Generating fresh Magic Formula candidates...")
         try:
-            # Stable S&P 500 list (Wikipedia is extremely reliable)
             sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]["Symbol"].tolist()
-
             candidates = []
-            for ticker in sp500[:150]:  # light lift — only first 150 to avoid rate limits
+            for ticker in sp500[:150]:
                 try:
                     info = yf.Ticker(ticker).info
-                    ey = 1 / info.get("forwardPE", 999) if info.get("forwardPE") else 0   # Earnings Yield proxy
-                    roc = info.get("returnOnEquity", 0) or info.get("returnOnCapital", 0)  # ROC proxy
+                    ey = 1 / info.get("forwardPE", 999) if info.get("forwardPE") else 0
+                    roc = info.get("returnOnEquity", 0) or info.get("returnOnCapital", 0)
                     score = ey + roc * 0.5
                     candidates.append((ticker, score))
                 except:
                     continue
-
             candidates.sort(key=lambda x: x[1], reverse=True)
             top = [t[0] for t in candidates[:n]]
             logger.info(f"Generated {len(top)} high-quality MF candidates")
@@ -125,7 +119,6 @@ class MagicFormulaScreener:
 class TrendFilter:
     @staticmethod
     def is_above_200_ma(symbol: str) -> bool:
-        """Robust 200-MA (exactly as requested)."""
         try:
             hist = yf.download(
                 symbol,
@@ -155,6 +148,14 @@ class TradeExecutor:
             return self.trading_client.get_clock().is_open
         except:
             return False
+
+    def is_first_trading_day_of_month(self) -> bool:
+        """Returns True only on the first trading day of the month (handles weekends & holidays)."""
+        if not self.is_market_open():
+            return False
+        today = datetime.now()
+        yesterday = today - timedelta(days=1)
+        return yesterday.month != today.month
 
     def has_sufficient_buying_power(self) -> bool:
         try:
@@ -226,21 +227,26 @@ def run_strategy():
     summary = ["*Magic Formula Bot — Daily Run*"]
     errors = []
 
-    # Market & capital guards
+    # Market guard
     if not executor.is_market_open():
-        summary.append("⏰ Market closed — no new trades today.")
+        summary.append("⏰ Market closed — no actions today.")
         send_telegram("\n".join(summary))
         return
-    if not executor.has_sufficient_buying_power():
-        summary.append("⚠️ Insufficient buying power — skipping new buys.")
+
+    summary.append("✅ Market open")
+
+    # First-trading-day check (new buys only on this day)
+    is_first_day = executor.is_first_trading_day_of_month()
+    if is_first_day:
+        summary.append("📅 **First trading day of the month** — new purchases enabled")
     else:
-        summary.append("✅ Market open + sufficient buying power")
+        summary.append("📅 Regular trading day — rebalancing only (no new purchases)")
 
     # Get live positions
     alpaca_positions = {p.symbol: p for p in pm.get_alpaca_positions()}
     today = datetime.now()
 
-    # Rebalancing logic (losers + monthly winner review)
+    # === REBALANCING (runs EVERY trading day) ===
     summary.append("\n*Rebalancing Existing Holdings:*")
     for symbol in list(alpaca_positions.keys()):
         meta = pm.metadata.get(symbol)
@@ -248,9 +254,8 @@ def run_strategy():
             continue
         days_held = (today - datetime.fromisoformat(meta.purchase_date)).days
 
-        # Loser rule
+        # Loser rule — runs daily to catch before 365 days even over holidays
         if days_held >= Config.LOSS_SELL_DAYS:
-            # Simple gain check (using latest price)
             try:
                 price = yf.Ticker(symbol).info.get("regularMarketPrice", meta.purchase_price)
                 gain = (price - meta.purchase_price) / meta.purchase_price
@@ -261,7 +266,7 @@ def run_strategy():
             except:
                 pass
 
-        # Winner monthly review after 1 year
+        # Winner monthly review (after 365 days) — runs daily but only sells if it fails screen
         if days_held >= Config.MIN_HOLD_DAYS_FOR_REVIEW:
             mf_list = screener.get_top_candidates()
             if symbol not in mf_list or not trend.is_above_200_ma(symbol):
@@ -270,27 +275,33 @@ def run_strategy():
                 continue
             summary.append(f"  ✅ {symbol} still qualifies — holding")
 
-    # New purchases
-    summary.append("\n*New Purchases:*")
-    mf_candidates = screener.get_top_candidates()
-    qualified = [t for t in mf_candidates if trend.is_above_200_ma(t)]
+    # === NEW PURCHASES (only on first trading day of the month) ===
+    if is_first_day:
+        summary.append("\n*New Purchases (First Trading Day):*")
+        if not executor.has_sufficient_buying_power():
+            summary.append("⚠️ Insufficient buying power — skipping new buys.")
+        else:
+            mf_candidates = screener.get_top_candidates()
+            qualified = [t for t in mf_candidates if trend.is_above_200_ma(t)]
 
-    current_holdings = set(alpaca_positions.keys())
-    to_buy = []
-    for t in qualified:
-        if t not in current_holdings and t not in to_buy:
-            to_buy.append(t)
-        if len(to_buy) >= Config.MAX_NEW_BUYS:
-            break
+            current_holdings = set(alpaca_positions.keys())
+            to_buy = []
+            for t in qualified:
+                if t not in current_holdings and t not in to_buy:
+                    to_buy.append(t)
+                if len(to_buy) >= Config.MAX_NEW_BUYS:
+                    break
 
-    if to_buy:
-        for ticker in to_buy:
-            if executor.buy_notional(ticker):
-                summary.append(f"  ✅ Bought **{ticker}** (${Config.CASH_PER_STOCK})")
+            if to_buy:
+                for ticker in to_buy:
+                    if executor.buy_notional(ticker):
+                        summary.append(f"  ✅ Bought **{ticker}** (${Config.CASH_PER_STOCK})")
+                    else:
+                        errors.append(f"Buy failed: {ticker}")
             else:
-                errors.append(f"Buy failed: {ticker}")
+                summary.append("  No new qualified stocks available.")
     else:
-        summary.append("  No new qualified stocks available.")
+        summary.append("\n*New Purchases:* Skipped (not first trading day of month)")
 
     # Final notification
     final_msg = "\n".join(summary)
