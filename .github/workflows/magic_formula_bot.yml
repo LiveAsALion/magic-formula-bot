@@ -1,50 +1,15 @@
-name: Magic Formula Bot
+name: Magic Formula Bot (DISABLED on main branch)
 
 on:
-  schedule:
-    # Every weekday (Mon–Fri) at 10:30 AM EST = 14:30 UTC
-    - cron: '30 14 * * 1-5'
-  workflow_dispatch:           # Allows manual triggering if needed
+  # Completely disabled — no schedule, no manual trigger
+  workflow_dispatch:           # Optional: keeps the "Run workflow" button but does nothing
+    if: false
 
 jobs:
   run-bot:
+    if: false                    # ← This line turns the whole job OFF
     runs-on: ubuntu-latest
-    timeout-minutes: 15        # Safety cap (bot usually finishes in 1–4 minutes)
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    - name: Cache pip dependencies
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-
-    - name: Run Magic Formula Bot
-      env:
-        ALPACA_API_KEY:     ${{ secrets.ALPACA_API_KEY }}
-        ALPACA_SECRET_KEY:  ${{ secrets.ALPACA_SECRET_KEY }}
-        TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
-        TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python main.py
-
-    - name: Notify on failure
-      if: failure()
-      run: |
-        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-          -d parse_mode="Markdown" \
-          -d text="🚨 **Magic Formula Bot failed in GitHub Actions!**%0ACheck: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+    - name: Disabled
+      run: echo "Old bot workflow is disabled on main branch. Use the second branch instead."
