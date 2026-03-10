@@ -13,9 +13,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest
+from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 import json
+import math # Import math for rounding
 
 # --- 1. CONFIGURATION ---
 API_KEY = os.getenv("ALPACA_API_KEY")
@@ -28,7 +29,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 CASH_PER_STOCK = 1000
-TRAIL_PERCENT = 10.0
 PORTFOLIO_FILE = "portfolio.json"
 
 # Initialize Alpaca Clients (only for trading, data will come from yfinance)
@@ -208,8 +208,11 @@ def is_above_200_ma(symbol):
         # Fetch data for a longer period to ensure 200 data points are available
         hist = ticker.history(period="1y") 
         
-        if hist.empty or len(hist) < 200:
-            print(f"⚠️ Not enough data for {symbol} to calculate 200-MA.")
+        if hist.empty:
+            print(f"⚠️ No historical data found for {symbol}. Skipping 200-MA calculation.")
+            return False
+        if len(hist) < 200:
+            print(f"⚠️ Not enough data ({len(hist)} days) for {symbol} to calculate 200-MA. Skipping.")
             return False
             
         current_price = hist["Close"].iloc[-1]
@@ -224,7 +227,6 @@ def is_above_200_ma(symbol):
 def run_strategy():
     current_date = datetime.now()
     portfolio = load_portfolio()
-    updated_portfolio = []
     
     summary_messages = []
     errors_encountered = []
@@ -235,7 +237,7 @@ def run_strategy():
     
     positions_to_sell = []
     positions_to_re_evaluate = []
-    positions_to_hold = []
+    positions_to_hold_after_rebalance = [] # This will be the new portfolio after initial sales
 
     for position in portfolio:
         symbol = position["symbol"]
@@ -246,7 +248,7 @@ def run_strategy():
         current_price = get_current_price(symbol)
         if current_price is None:
             errors_encountered.append(f"⚠️ Could not get current price for {symbol}. Skipping re-evaluation.")
-            positions_to_hold.append(position) # Keep if price cannot be fetched
+            positions_to_hold_after_rebalance.append(position) # Keep if price cannot be fetched
             continue
             
         gain_loss_percent = ((current_price - purchase_price) / purchase_price) * 100
@@ -265,20 +267,20 @@ def run_strategy():
             summary_messages.append(f"  - 📈 Re-evaluating {symbol} (gain after 366 days).")
         else:
             # Hold if not yet at re-evaluation point
-            positions_to_hold.append(position)
+            positions_to_hold_after_rebalance.append(position)
             
     # Execute sales for positions_to_sell
     for sale_item in positions_to_sell:
         symbol = sale_item["symbol"]
         try:
             trading_client.close_position(symbol)
-            # Position is removed from portfolio implicitly by not being added to updated_portfolio
+            # Position is removed from portfolio implicitly by not being added to positions_to_hold_after_rebalance
         except Exception as e:
             errors_encountered.append(f"❌ Error selling {symbol}: {e}")
             # If sale fails, keep in portfolio for next run
             for p in portfolio:
                 if p["symbol"] == symbol:
-                    positions_to_hold.append(p)
+                    positions_to_hold_after_rebalance.append(p)
                     break
 
     # --- New Stock Screening and Buying ---
@@ -301,28 +303,31 @@ def run_strategy():
 
     # --- Re-evaluation of Gaining Positions against New MF List ---
     summary_messages.append("\n📈 *Gaining Positions Re-evaluation:*")
+    final_portfolio_after_re_eval = []
     for position in positions_to_re_evaluate:
         symbol = position["symbol"]
         
-        # Check if it\'s in the top 10 of the newly screened MF list
+        # Check if it\\\\'s in the top 10 of the newly screened MF list
         if symbol in screened_mf_picks[:10]: # Top 10 of the new MF list
             summary_messages.append(f"  - ✅ Holding {symbol} for another year (still a top MF pick).")
             # Update purchase date to effectively reset the 366-day timer for re-evaluation
             position["purchase_date"] = current_date.isoformat()
-            positions_to_hold.append(position)
+            final_portfolio_after_re_eval.append(position)
         else:
             summary_messages.append(f"  - ❌ Selling {symbol} (gain but not in top MF picks after 366 days).")
             try:
                 trading_client.close_position(symbol)
             except Exception as e:
                 errors_encountered.append(f"❌ Error selling {symbol}: {e}")
-                positions_to_hold.append(position) # Keep if sale fails
-            
-    save_portfolio(positions_to_hold) # Save portfolio after re-evaluation and sales
+                final_portfolio_after_re_eval.append(position) # Keep if sale fails
+    
+    # Add positions that were held from the initial rebalance
+    final_portfolio_after_re_eval.extend(positions_to_hold_after_rebalance)
+    save_portfolio(final_portfolio_after_re_eval) # Save portfolio after re-evaluation and sales
 
     # --- Buy New Stocks ---
     summary_messages.append("\n🛒 *New Stock Purchases:*")
-    current_holdings = [p["symbol"] for p in positions_to_hold]
+    current_holdings = [p["symbol"] for p in final_portfolio_after_re_eval]
     new_picks_to_buy = []
     for t in screened_mf_picks:
         if t not in current_holdings:
@@ -337,34 +342,60 @@ def run_strategy():
         for ticker in new_picks_to_buy:
             try:
                 symbol = ticker.replace(".", "-")
-                # Place Market Order
+                current_price = get_current_price(symbol)
+                if current_price is None:
+                    errors_encountered.append(f"❌ Could not get current price for {symbol}. Skipping purchase.")
+                    continue
+
+                # Calculate whole number of shares to buy
+                qty_to_buy = math.floor(CASH_PER_STOCK / current_price)
+                
+                if qty_to_buy == 0:
+                    errors_encountered.append(f"⚠️ Not enough funds ({CASH_PER_STOCK}) to buy even 1 whole share of {symbol} at ${current_price:.2f}. Skipping purchase.")
+                    continue
+
+                # Place Market Order for whole quantity
                 order = trading_client.submit_order(MarketOrderRequest(
-                    symbol=symbol, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+                    symbol=symbol, qty=qty_to_buy, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
                 ))
                 time.sleep(5) # Wait for fill
                 
-                # Assuming order is filled, add to portfolio
-                current_price_at_buy = get_current_price(symbol)
-                if current_price_at_buy:
+                # Get actual filled quantity from Alpaca after the order fills
+                actual_pos = None
+                for _ in range(5): # Try a few times to get the position
+                    try:
+                        actual_pos = trading_client.get_open_position(symbol)
+                        if actual_pos and float(actual_pos.qty) > 0: 
+                            break
+                    except Exception as e:
+                        print(f"DEBUG: Error getting position for {symbol} (attempt {_ + 1}): {e}")
+                        time.sleep(2)
+                
+                if actual_pos and float(actual_pos.qty) > 0:
+                    filled_qty = float(actual_pos.qty)
+                    # Use the current price for portfolio tracking as a proxy for purchase price
+                    # A more robust solution would fetch the actual fill price from the order object
+                    purchase_price_for_record = current_price 
+                    
                     new_position = {
                         "symbol": symbol,
                         "purchase_date": current_date.isoformat(),
-                        "purchase_price": current_price_at_buy,
-                        "quantity": CASH_PER_STOCK / current_price_at_buy # Approximate quantity
+                        "purchase_price": purchase_price_for_record,
+                        "quantity": filled_qty
                     }
-                    positions_to_hold.append(new_position)
-                    save_portfolio(positions_to_hold)
+                    final_portfolio_after_re_eval.append(new_position)
+                    save_portfolio(final_portfolio_after_re_eval)
 
-                # Place Trailing Stop
-                trading_client.submit_order(TrailingStopOrderRequest(
-                    symbol=symbol, qty=new_position["quantity"], side=OrderSide.SELL, time_in_force=TimeInForce.GTC, trail_percent=TRAIL_PERCENT
-                ))
-                summary_messages.append(f"  - ✅ Purchased **{ticker}** (Qty: {new_position['quantity']:.2f} @ ${new_position['purchase_price']:.2f}).")
+                    summary_messages.append(f"  - ✅ Purchased **{ticker}** (Qty: {filled_qty:.0f} @ ${purchase_price_for_record:.2f}).")
+                else:
+                    errors_encountered.append(f"❌ Could not confirm position for {ticker}. Order might not have filled.")
+                    summary_messages.append(f"  - ⚠️ Attempted purchase of **{ticker}**. Order fill failed.")
+
             except Exception as e:
                 errors_encountered.append(f"❌ Error purchasing {ticker}: {e}")
     
     # Final Summary Message
-    final_summary = f"*Magic Formula Bot Run Summary - {current_date.strftime('%Y-%m-%d %H:%M')} EST*\n\n" + "\n".join(summary_messages)
+    final_summary = f"*Magic Formula Bot Run Summary - {current_date.strftime("%Y-%m-%d %H:%M")} EST*\n\n" + "\n".join(summary_messages)
     if errors_encountered:
         final_summary += "\n\n⚠️ *Errors/Warnings:*\n" + "\n".join(errors_encountered)
     
