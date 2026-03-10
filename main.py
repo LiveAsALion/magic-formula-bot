@@ -15,6 +15,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+import json
 
 # --- 1. CONFIGURATION ---
 API_KEY = os.getenv("ALPACA_API_KEY")
@@ -28,10 +29,39 @@ MY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (K
 
 CASH_PER_STOCK = 1000
 TRAIL_PERCENT = 10.0
+PORTFOLIO_FILE = "portfolio.json"
 
 # Initialize Alpaca Clients (only for trading, data will come from yfinance)
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-# data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY) # No longer needed for historical data
+
+# --- Helper Functions for Portfolio Management ---
+def load_portfolio():
+    if os.path.exists(PORTFOLIO_FILE):
+        with open(PORTFOLIO_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_portfolio(portfolio):
+    with open(PORTFOLIO_FILE, "w") as f:
+        json.dump(portfolio, f, indent=4)
+
+def get_current_price(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            return hist["Close"].iloc[-1]
+    except Exception as e:
+        print(f"Error getting current price for {symbol}: {e}")
+    return None
+
+def send_telegram_message(message):
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        try:
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
+        except Exception as e:
+            print(f"Error sending Telegram message: {e}")
 
 # --- 2. THE IMPROVED SCRAPER ---
 def get_official_mf_tickers():
@@ -192,60 +222,154 @@ def is_above_200_ma(symbol):
 
 # --- 4. EXECUTION ENGINE ---
 def run_strategy():
-    tickers, status_msg = get_official_mf_tickers()
+    current_date = datetime.now()
+    portfolio = load_portfolio()
+    updated_portfolio = []
     
-    # Heartbeat to Telegram
-    if TELEGRAM_TOKEN:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        try:
-            requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": f"💓 **Heartbeat**: {status_msg}", "parse_mode": "Markdown"}, timeout=10)
-        except:
-            pass
-    
-    if not tickers:
-        print(f"🛑 Run ended: {status_msg}")
-        return
+    summary_messages = []
+    errors_encountered = []
 
-    # Find the top 5 that are currently in an uptrend
-    print(f"🔍 Screening {len(tickers)} stocks for 200-MA trend...")
-    final_picks = []
-    for t in tickers:
-        if is_above_200_ma(t):
-            print(f"✅ {t} is above 200-MA.")
-            final_picks.append(t)
-            if len(final_picks) >= 5:
-                break
-        else:
-            # print(f"❌ {t} is below 200-MA.")
-            pass
+    # --- Portfolio Rebalancing and Exit Strategy ---
+    print("📊 Evaluating existing portfolio positions...")
+    summary_messages.append("📊 *Portfolio Rebalancing:*")
     
-    if not final_picks:
-        print("📊 No stocks above 200-MA found in the current list.")
-        return
+    positions_to_sell = []
+    positions_to_re_evaluate = []
+    positions_to_hold = []
 
-    print(f"🚀 Executing trades for: {final_picks}")
-    summary = "🚀 **Trades Executed**\n"
-    for ticker in final_picks:
-        try:
-            symbol = ticker.replace(".", "-")
-            # Place Market Order
-            trading_client.submit_order(MarketOrderRequest(
-                symbol=symbol, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
-            ))
-            time.sleep(5) # Wait for fill
+    for position in portfolio:
+        symbol = position["symbol"]
+        purchase_date = datetime.fromisoformat(position["purchase_date"])
+        purchase_price = position["purchase_price"]
+        quantity = position["quantity"]
+        
+        current_price = get_current_price(symbol)
+        if current_price is None:
+            errors_encountered.append(f"⚠️ Could not get current price for {symbol}. Skipping re-evaluation.")
+            positions_to_hold.append(position) # Keep if price cannot be fetched
+            continue
             
-            # Place Trailing Stop
-            pos = trading_client.get_open_position(symbol)
-            trading_client.submit_order(TrailingStopOrderRequest(
-                symbol=symbol, qty=pos.qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, trail_percent=TRAIL_PERCENT
-            ))
-            summary += f"✅ **{ticker}**\n"
+        gain_loss_percent = ((current_price - purchase_price) / purchase_price) * 100
+        days_held = (current_date - purchase_date).days
+        
+        print(f"  - {symbol}: Days held={days_held}, Gain/Loss={gain_loss_percent:.2f}%")
+
+        # Rule 1: Sell overall loss after 360 days
+        if gain_loss_percent < 0 and days_held >= 360:
+            positions_to_sell.append({"symbol": symbol, "reason": "loss after 360 days"})
+            summary_messages.append(f"  - 📉 Selling {symbol} (loss after 360 days).")
+            
+        # Rule 2 & 3: Re-evaluate gains after 366 days
+        elif gain_loss_percent >= 0 and days_held >= 366:
+            positions_to_re_evaluate.append(position)
+            summary_messages.append(f"  - 📈 Re-evaluating {symbol} (gain after 366 days).")
+        else:
+            # Hold if not yet at re-evaluation point
+            positions_to_hold.append(position)
+            
+    # Execute sales for positions_to_sell
+    for sale_item in positions_to_sell:
+        symbol = sale_item["symbol"]
+        try:
+            trading_client.close_position(symbol)
+            # Position is removed from portfolio implicitly by not being added to updated_portfolio
         except Exception as e:
-            summary += f"❌ **{ticker}**: {e}\n"
+            errors_encountered.append(f"❌ Error selling {symbol}: {e}")
+            # If sale fails, keep in portfolio for next run
+            for p in portfolio:
+                if p["symbol"] == symbol:
+                    positions_to_hold.append(p)
+                    break
+
+    # --- New Stock Screening and Buying ---
+    mf_tickers, status_msg = get_official_mf_tickers()
+    if mf_tickers is None:
+        errors_encountered.append(f"❌ Magic Formula Scraper Error: {status_msg}")
+        summary_messages.append(f"🛑 Run ended prematurely due to scraper error.")
+        send_telegram_message("\n".join(summary_messages + errors_encountered))
+        return
+
+    # Filter MF tickers by 200-MA and get top 10 for re-evaluation
+    print(f"🔍 Screening {len(mf_tickers)} stocks for 200-MA trend...")
+    screened_mf_picks = []
+    for t in mf_tickers:
+        if is_above_200_ma(t):
+            screened_mf_picks.append(t)
     
-    if TELEGRAM_TOKEN and "✅" in summary:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": summary, "parse_mode": "Markdown"}, timeout=10)
+    if not screened_mf_picks:
+        summary_messages.append("📊 No Magic Formula stocks above 200-MA found in the current list.")
+
+    # --- Re-evaluation of Gaining Positions against New MF List ---
+    summary_messages.append("\n📈 *Gaining Positions Re-evaluation:*")
+    for position in positions_to_re_evaluate:
+        symbol = position["symbol"]
+        
+        # Check if it\'s in the top 10 of the newly screened MF list
+        if symbol in screened_mf_picks[:10]: # Top 10 of the new MF list
+            summary_messages.append(f"  - ✅ Holding {symbol} for another year (still a top MF pick).")
+            # Update purchase date to effectively reset the 366-day timer for re-evaluation
+            position["purchase_date"] = current_date.isoformat()
+            positions_to_hold.append(position)
+        else:
+            summary_messages.append(f"  - ❌ Selling {symbol} (gain but not in top MF picks after 366 days).")
+            try:
+                trading_client.close_position(symbol)
+            except Exception as e:
+                errors_encountered.append(f"❌ Error selling {symbol}: {e}")
+                positions_to_hold.append(position) # Keep if sale fails
+            
+    save_portfolio(positions_to_hold) # Save portfolio after re-evaluation and sales
+
+    # --- Buy New Stocks ---
+    summary_messages.append("\n🛒 *New Stock Purchases:*")
+    current_holdings = [p["symbol"] for p in positions_to_hold]
+    new_picks_to_buy = []
+    for t in screened_mf_picks:
+        if t not in current_holdings:
+            new_picks_to_buy.append(t)
+        if len(new_picks_to_buy) >= 5: # Limit to 5 new picks for now
+            break
+
+    if not new_picks_to_buy:
+        summary_messages.append("  - 📊 No new stocks to buy based on current screening and portfolio.")
+    else:
+        print(f"🚀 Executing trades for new picks: {new_picks_to_buy}")
+        for ticker in new_picks_to_buy:
+            try:
+                symbol = ticker.replace(".", "-")
+                # Place Market Order
+                order = trading_client.submit_order(MarketOrderRequest(
+                    symbol=symbol, notional=CASH_PER_STOCK, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+                ))
+                time.sleep(5) # Wait for fill
+                
+                # Assuming order is filled, add to portfolio
+                current_price_at_buy = get_current_price(symbol)
+                if current_price_at_buy:
+                    new_position = {
+                        "symbol": symbol,
+                        "purchase_date": current_date.isoformat(),
+                        "purchase_price": current_price_at_buy,
+                        "quantity": CASH_PER_STOCK / current_price_at_buy # Approximate quantity
+                    }
+                    positions_to_hold.append(new_position)
+                    save_portfolio(positions_to_hold)
+
+                # Place Trailing Stop
+                trading_client.submit_order(TrailingStopOrderRequest(
+                    symbol=symbol, qty=new_position["quantity"], side=OrderSide.SELL, time_in_force=TimeInForce.GTC, trail_percent=TRAIL_PERCENT
+                ))
+                summary_messages.append(f"  - ✅ Purchased **{ticker}** (Qty: {new_position['quantity']:.2f} @ ${new_position['purchase_price']:.2f}).")
+            except Exception as e:
+                errors_encountered.append(f"❌ Error purchasing {ticker}: {e}")
+    
+    # Final Summary Message
+    final_summary = f"*Magic Formula Bot Run Summary - {current_date.strftime('%Y-%m-%d %H:%M')} EST*\n\n" + "\n".join(summary_messages)
+    if errors_encountered:
+        final_summary += "\n\n⚠️ *Errors/Warnings:*
+" + "\n".join(errors_encountered)
+    
+    send_telegram_message(final_summary)
 
 if __name__ == "__main__":
     run_strategy()
