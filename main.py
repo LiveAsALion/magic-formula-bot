@@ -11,7 +11,7 @@ import pandas as pd
 import yfinance as yf
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
+from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # ====================== CONFIGURATION ======================
@@ -25,7 +25,6 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     LOG_FILE = "bot.log"
 
-
 # ====================== LOGGING ======================
 logging.basicConfig(
     level=logging.INFO,
@@ -37,14 +36,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ====================== DATA CLASSES ======================
 @dataclass
 class PositionMetadata:
     symbol: str
     purchase_date: str
     purchase_price: float
-
 
 # ====================== PORTFOLIO MANAGER ======================
 class PortfolioManager:
@@ -88,7 +85,6 @@ class PortfolioManager:
         self.metadata.pop(symbol, None)
         self.save_metadata()
 
-
 # ====================== MAGIC FORMULA SCREENER ======================
 class MagicFormulaScreener:
     @staticmethod
@@ -114,7 +110,6 @@ class MagicFormulaScreener:
             logger.error(f"MF screener failed: {e}")
             return []
 
-
 # ====================== TREND FILTER ======================
 class TrendFilter:
     @staticmethod
@@ -136,7 +131,6 @@ class TrendFilter:
             logger.debug(f"MA check failed for {symbol}: {e}")
             return False
 
-
 # ====================== TRADE EXECUTOR ======================
 class TradeExecutor:
     def __init__(self, trading_client: TradingClient, portfolio_manager: PortfolioManager):
@@ -150,7 +144,6 @@ class TradeExecutor:
             return False
 
     def is_first_trading_day_of_month(self) -> bool:
-        """Returns True only on the first trading day of the month (handles weekends & holidays)."""
         if not self.is_market_open():
             return False
         today = datetime.now()
@@ -196,7 +189,6 @@ class TradeExecutor:
             logger.error(f"Buy failed for {symbol}: {e}")
             return None
 
-
 # ====================== NOTIFICATIONS ======================
 def send_telegram(message: str):
     if Config.TELEGRAM_TOKEN and Config.TELEGRAM_CHAT_ID:
@@ -208,7 +200,6 @@ def send_telegram(message: str):
             )
         except:
             pass
-
 
 # ====================== MAIN RUN ======================
 def run_strategy():
@@ -227,7 +218,6 @@ def run_strategy():
     summary = ["*Magic Formula Bot — Daily Run*"]
     errors = []
 
-    # Market guard
     if not executor.is_market_open():
         summary.append("⏰ Market closed — no actions today.")
         send_telegram("\n".join(summary))
@@ -235,18 +225,15 @@ def run_strategy():
 
     summary.append("✅ Market open")
 
-    # First-trading-day check (new buys only on this day)
     is_first_day = executor.is_first_trading_day_of_month()
     if is_first_day:
         summary.append("📅 **First trading day of the month** — new purchases enabled")
     else:
         summary.append("📅 Regular trading day — rebalancing only (no new purchases)")
 
-    # Get live positions
     alpaca_positions = {p.symbol: p for p in pm.get_alpaca_positions()}
     today = datetime.now()
 
-    # === REBALANCING (runs EVERY trading day) ===
     summary.append("\n*Rebalancing Existing Holdings:*")
     for symbol in list(alpaca_positions.keys()):
         meta = pm.metadata.get(symbol)
@@ -254,7 +241,6 @@ def run_strategy():
             continue
         days_held = (today - datetime.fromisoformat(meta.purchase_date)).days
 
-        # Loser rule — runs daily to catch before 365 days even over holidays
         if days_held >= Config.LOSS_SELL_DAYS:
             try:
                 price = yf.Ticker(symbol).info.get("regularMarketPrice", meta.purchase_price)
@@ -266,7 +252,6 @@ def run_strategy():
             except:
                 pass
 
-        # Winner monthly review (after 365 days) — runs daily but only sells if it fails screen
         if days_held >= Config.MIN_HOLD_DAYS_FOR_REVIEW:
             mf_list = screener.get_top_candidates()
             if symbol not in mf_list or not trend.is_above_200_ma(symbol):
@@ -275,7 +260,6 @@ def run_strategy():
                 continue
             summary.append(f"  ✅ {symbol} still qualifies — holding")
 
-    # === NEW PURCHASES (only on first trading day of the month) ===
     if is_first_day:
         summary.append("\n*New Purchases (First Trading Day):*")
         if not executor.has_sufficient_buying_power():
@@ -303,14 +287,12 @@ def run_strategy():
     else:
         summary.append("\n*New Purchases:* Skipped (not first trading day of month)")
 
-    # Final notification
     final_msg = "\n".join(summary)
     if errors:
         final_msg += "\n\n⚠️ Errors:\n" + "\n".join(errors)
     send_telegram(final_msg)
 
     logger.info("=== Bot Run Completed ===")
-
 
 if __name__ == "__main__":
     run_strategy()
