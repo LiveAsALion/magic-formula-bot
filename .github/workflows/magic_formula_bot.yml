@@ -3,7 +3,7 @@ name: Magic Formula Bot
 on:
   schedule:
     # Every weekday (Mon–Fri) at 10:30 AM EST = 14:30 UTC
-    - cron: '30 14 * * 1-5'
+    - cron: '0 15 * * 1-5'
   workflow_dispatch:           # Allows manual triggering if needed
 
 jobs:
